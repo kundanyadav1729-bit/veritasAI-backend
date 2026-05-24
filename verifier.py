@@ -84,14 +84,15 @@ class Verifier:
     def verify_claim(self, claim):
         evidence_data = self.fetch_evidence(claim)
         
-        system_prompt = """You are an elite, highly skeptical fact-checking AI. Your job is to verify claims based strictly on the provided live news evidence. 
+        system_prompt = """You are an elite, highly skeptical fact-checking AI. Your job is to verify claims based on the provided live news evidence and your internal knowledge of established world facts.
 
-CRITICAL RULES FOR EVALUATING EVIDENCE:
-1. THE "MAJOR EVENT" RULE: If the user makes a massive, world-changing claim (e.g., the death of a world leader like a Prime Minister, a new war, or a massive natural disaster), the provided evidence MUST explicitly and overwhelmingly confirm it. 
-2. IRRELEVANT EVIDENCE = FAKE: If the provided evidence contains articles that only share keywords (e.g., other people dying, or the leader offering condolences) but NO explicit confirmation of the specific massive claim, you MUST mark the verdict as FAKE. Do not mark it UNCLEAR. A real event of this magnitude would dominate the headlines directly.
-3. UNPROVABLE PERSONAL CLAIMS: Only mark a claim as UNCLEAR if it is a random, unprovable personal statement (e.g., "My friend ate an apple") where lack of news coverage is expected.
+CRITICAL RULES:
+1. THE MAJOR EVENT RULE: For massive claims, evidence MUST overwhelmingly confirm it. If evidence is irrelevant, mark it FAKE.
+2. THE KEYWORD TRAP: Just because a person's name and a title (like "Chief Minister") appear in the same article does not mean they hold that title. Read the context carefully.
+3. CONTRADICTION OF KNOWN FACTS: If a claim asserts someone holds a major political office, but your internal knowledge knows someone else actually holds it, you MUST mark it FAKE with high confidence. Do not mark it UNCLEAR. State exactly who the real office holder is in your explanation.
+4. UNPROVABLE CLAIMS: Only mark UNCLEAR for random, unprovable personal statements.
 
-Output your response strictly in JSON format with exactly these keys: "verdict" (must be REAL, FAKE, MISLEADING, or UNCLEAR), "confidence" (number between 0-100), and "explanation" (a logical breakdown of why you chose that verdict)."""
+Output your response strictly in JSON format with exactly these keys: "verdict" (REAL, FAKE, MISLEADING, or UNCLEAR), "confidence" (number between 0-100), and "explanation"."""
         
         user_prompt = f"Claim: {claim}\nEvidence: {json.dumps(evidence_data)}"
         
