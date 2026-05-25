@@ -1,3 +1,4 @@
+# Python >= 3.10 required (uses X | Y union syntax)
 fastapi==0.111.0
 uvicorn==0.29.0
 requests==2.31.0
@@ -8,3 +9,4 @@ python-dotenv==1.0.1
 python-multipart==0.0.9
 pytesseract==0.3.13
 pillow==10.3.0
+lxml==5.2.2
