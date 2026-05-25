@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -16,8 +17,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# Injected into every prompt so the LLM is temporally anchored
 CURRENT_DATE: str = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+# Wikipedia blocks generic Chrome UAs — must use a descriptive bot UA
+WIKI_HEADERS = {
+    "User-Agent": "FakeNewsDetector/1.0 (educational project; python-requests) python-requests/2.31"
+}
 
 
 class Verifier:
@@ -34,11 +39,11 @@ class Verifier:
             "altnews.in", "boomlive.in", "pib.gov.in", "vishvasnews.com",
             "reuters.com", "apnews.com", "bbc.com", "snopes.com", "politifact.com",
             "factcheck.org", "theprint.in", "scroll.in", "thewire.in",
-            "en.wikipedia.org",   # Wikipedia added as a trusted source
+            "en.wikipedia.org",
         ]
 
-        # Full UA string — truncated UA triggers bot-detection on many sites
-        self.headers = {
+        # Full Chrome UA for news sites
+        self.news_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -54,7 +59,6 @@ class Verifier:
         return any(src in url.lower() for src in self.trusted_sources)
 
     def validate_claim(self, claim: str) -> Optional[str]:
-        """Returns an error string if the claim is invalid, else None."""
         stripped = claim.strip() if claim else ""
         if not stripped:
             return "Claim cannot be empty."
@@ -65,10 +69,6 @@ class Verifier:
         return None
 
     def _parse_pub_date(self, item) -> Optional[str]:
-        """
-        Extract a normalized publication date from an RSS <item>.
-        Returns a string like '2024-11-15 08:30 UTC', or None.
-        """
         tag = item.find("pubDate")
         if not tag:
             return None
@@ -80,22 +80,10 @@ class Verifier:
             return raw if raw else None
 
     def _classify_evidence_quality(self, evidence_data: List[dict]) -> str:
-        """
-        Assign a quality tier used to calibrate the LLM's confidence ceiling.
-
-        Tiers (worst to best):
-          NO_EVIDENCE     - nothing fetched at all
-          HEADLINES_ONLY  - items exist but none have full text
-          LOW_TRUST       - full text available but zero trusted-source coverage
-          MEDIUM_QUALITY  - partial trusted or partial full-text coverage
-          HIGH_QUALITY    - 2 or more trusted sources with full text
-        """
         if not evidence_data:
             return "NO_EVIDENCE"
-
         fully_scraped = sum(1 for e in evidence_data if e.get("quality") == "full_text")
         trusted_count = sum(1 for e in evidence_data if e["trusted"])
-
         if fully_scraped == 0:
             return "HEADLINES_ONLY"
         if trusted_count == 0:
@@ -105,15 +93,7 @@ class Verifier:
         return "MEDIUM_QUALITY"
 
     def _extract_subject(self, claim: str) -> str:
-        """
-        Best-effort extraction of the subject entity from a claim.
-        Used to build a targeted Wikipedia lookup.
-        Examples:
-          'Suvendu Adhikari is the CM of West Bengal' -> 'Suvendu Adhikari'
-          'Mamata Banerjee became PM of India'        -> 'Mamata Banerjee'
-        Falls back to the full claim if no pattern matches.
-        """
-        # Pattern: <Name> is/are/was/became/has ...
+        """Extract person/subject name from a claim string."""
         match = re.match(
             r"^([A-Z][a-zA-Z\s\.\-]{2,40?})\s+(?:is|are|was|were|became|has|have|had)\b",
             claim.strip()
@@ -122,86 +102,148 @@ class Verifier:
             return match.group(1).strip()
         return claim.strip()
 
+    def _extract_political_position(self, claim: str) -> Optional[str]:
+        """
+        Detect and extract a political position from a claim.
+        Returns a Wikipedia-searchable position string, or None.
+
+        Examples:
+          'Suvendu Adhikari is the CM of West Bengal'
+              → 'Chief Minister of West Bengal'
+          'Modi is the PM of India'
+              → 'Prime Minister of India'
+        """
+        claim_lower = claim.lower()
+
+        # Map of abbreviations / keywords → full Wikipedia title fragment
+        position_patterns = [
+            (r'\b(chief minister|cm)\b.*?\bof\s+([a-z\s]+)', 'Chief Minister of {}'),
+            (r'\b(prime minister|pm)\b.*?\bof\s+([a-z\s]+)', 'Prime Minister of {}'),
+            (r'\b(president)\b.*?\bof\s+([a-z\s]+)', 'President of {}'),
+            (r'\b(governor)\b.*?\bof\s+([a-z\s]+)', 'Governor of {}'),
+            (r'\b(deputy chief minister|deputy cm)\b.*?\bof\s+([a-z\s]+)', 'Deputy Chief Minister of {}'),
+        ]
+
+        for pattern, template in position_patterns:
+            m = re.search(pattern, claim_lower)
+            if m:
+                # Last captured group is the place name
+                place = m.group(m.lastindex).strip().title()
+                # Clean trailing noise words
+                place = re.sub(r'\b(the|a|an|its|his|her)\b', '', place).strip()
+                return template.format(place)
+
+        return None
+
     # ─────────────────────────────────────────────
     # SCRAPING
     # ─────────────────────────────────────────────
 
     def scrape_article(self, url: str) -> Optional[str]:
-        """Scrape and return paragraph text from a URL, capped at 3000 chars."""
+        """Scrape paragraph text from a URL, capped at 3000 chars."""
         try:
-            response = self.session.get(url, headers=self.headers, timeout=7)
+            response = self.session.get(url, headers=self.news_headers, timeout=7)
             response.raise_for_status()
-
             soup = BeautifulSoup(response.text, "html.parser")
-
             for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 tag.decompose()
-
             paragraphs = soup.find_all("p")
             text = " ".join(p.get_text(strip=True) for p in paragraphs)
             text = re.sub(r"\s+", " ", text).strip()
-
             return text[:3000] if len(text) > 150 else None
-
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout scraping: {url}")
         except requests.exceptions.HTTPError as e:
             logger.warning(f"HTTP {e.response.status_code} scraping: {url}")
         except Exception as e:
             logger.warning(f"Scrape failed for {url}: {e}")
-
         return None
 
     # ─────────────────────────────────────────────
     # WIKIPEDIA FETCH
     # ─────────────────────────────────────────────
 
-    def fetch_wikipedia_summary(self, query: str) -> Optional[dict]:
+    def _wiki_fetch(self, title: str) -> Optional[dict]:
         """
-        Fetch a Wikipedia article summary using the Wikipedia REST API.
-        No scraping needed — the API always returns clean JSON.
-        Tries the full query first, then the extracted subject name.
-        Returns an evidence dict on success, None on failure.
+        Internal helper — fetch one Wikipedia article by title.
+        Uses the MediaWiki action API with a bot-friendly User-Agent.
+        Returns an evidence dict or None.
         """
-        candidates = list(dict.fromkeys([
-            self._extract_subject(query),   # e.g. "Suvendu Adhikari"
-            query.strip(),                  # full claim as fallback
-        ]))
+        url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "prop": "extracts",
+            "exintro": True,
+            "explaintext": True,
+            "titles": title,
+            "format": "json",
+            "redirects": 1,
+        }
+        try:
+            r = self.session.get(url, params=params, headers=WIKI_HEADERS, timeout=8)
+            if r.status_code != 200:
+                logger.warning(f"   📖 Wikipedia HTTP {r.status_code} for '{title}'")
+                return None
 
-        for candidate in candidates:
-            # Wikipedia REST API expects underscores and title-case
-            title = candidate.strip().replace(" ", "_")
-            url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
-            try:
-                response = self.session.get(url, headers=self.headers, timeout=6)
-                if response.status_code == 200:
-                    data = response.json()
-                    extract = data.get("extract", "").strip()
+            data = r.json()
+            pages = data.get("query", {}).get("pages", {})
+            for pid, page in pages.items():
+                if pid == "-1":
+                    logger.info(f"   📖 Wikipedia: no article found for '{title}'")
+                    return None
+                extract = page.get("extract", "").strip()
+                if len(extract) > 150:
+                    page_title = page.get("title", title)
                     page_url = (
-                        data.get("content_urls", {})
-                            .get("desktop", {})
-                            .get("page", url)
+                        f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
                     )
-                    if len(extract) > 150:
-                        logger.info(f"   📖 Wikipedia hit: '{data.get('title', candidate)}'")
-                        return {
-                            "url": page_url,
-                            "title": f"Wikipedia — {data.get('title', candidate)}",
-                            "text": extract[:3000],
-                            "trusted": True,
-                            "pub_date": None,
-                            "quality": "full_text",
-                        }
-                elif response.status_code == 404:
-                    logger.info(f"   📖 Wikipedia: no article for '{candidate}'")
-                else:
-                    logger.warning(
-                        f"   📖 Wikipedia returned HTTP {response.status_code} for '{candidate}'"
-                    )
-            except Exception as e:
-                logger.warning(f"Wikipedia fetch failed for '{candidate}': {e}")
-
+                    logger.info(f"   📖 Wikipedia hit: '{page_title}'")
+                    return {
+                        "url": page_url,
+                        "title": f"Wikipedia — {page_title}",
+                        "text": extract[:3000],
+                        "trusted": True,
+                        "pub_date": None,
+                        "quality": "full_text",
+                        "source_type": "wikipedia",
+                    }
+        except Exception as e:
+            logger.warning(f"   📖 Wikipedia fetch failed for '{title}': {e}")
         return None
+
+    def fetch_wikipedia_evidence(self, claim: str) -> List[dict]:
+        """
+        Fetch up to TWO Wikipedia articles per claim:
+
+          1. The POSITION page  e.g. 'Chief Minister of West Bengal'
+             → Lists who currently holds that office. Most up-to-date.
+
+          2. The PERSON page    e.g. 'Suvendu Adhikari'
+             → May lag behind breaking changes but gives biographical context.
+
+        Fetching both lets the LLM cross-reference them and detect staleness.
+        """
+        results: List[dict] = []
+
+        # -- Article 1: position page (most reliable for 'who holds X office') --
+        position = self._extract_political_position(claim)
+        if position:
+            logger.info(f"   📖 Fetching Wikipedia position page: '{position}'")
+            wiki = self._wiki_fetch(position)
+            if wiki:
+                wiki["wiki_type"] = "position_page"
+                results.append(wiki)
+
+        # -- Article 2: person/subject page --
+        subject = self._extract_subject(claim)
+        if subject and subject.lower() != claim.strip().lower():
+            logger.info(f"   📖 Fetching Wikipedia person page: '{subject}'")
+            wiki2 = self._wiki_fetch(subject)
+            if wiki2:
+                wiki2["wiki_type"] = "person_page"
+                results.append(wiki2)
+
+        return results
 
     # ─────────────────────────────────────────────
     # EVIDENCE FETCHING
@@ -209,14 +251,13 @@ class Verifier:
 
     def fetch_evidence(self, query: str) -> List[dict]:
         """
-        Fetches live evidence for a claim from two sources:
-          1. Google News RSS  — recent news articles
-          2. Wikipedia REST   — reliable reference for people, places, positions
+        Fetches live evidence from two sources:
+          1. Google News RSS  — recent news (headlines + scraped text where possible)
+          2. Wikipedia        — position page + person page for political claims
 
-        Each evidence dict contains:
-          url, title, text, trusted (bool), pub_date (str|None), quality (str)
-
-        quality values: "full_text" | "headline_only"
+        Each evidence dict:
+          url, title, text, trusted (bool), pub_date (str|None),
+          quality ('full_text'|'headline_only'), source_type (str)
         """
         evidence: List[dict] = []
         logger.info(f"🕵️  Starting evidence search for: {query}")
@@ -228,8 +269,7 @@ class Verifier:
                 f"https://news.google.com/rss/search"
                 f"?q={formatted_query}&hl=en-IN&gl=IN&ceid=IN:en"
             )
-
-            response = self.session.get(rss_url, headers=self.headers, timeout=6)
+            response = self.session.get(rss_url, headers=self.news_headers, timeout=6)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, "lxml-xml")
@@ -237,7 +277,6 @@ class Verifier:
             logger.info(f"   → Found {len(items)} RSS items. Processing...")
 
             scraped_count = 0
-
             for item in items[:12]:
                 if scraped_count >= 5:
                     break
@@ -245,11 +284,9 @@ class Verifier:
                 title_tag = item.find("title")
                 link_tag  = item.find("link")
                 pub_date  = self._parse_pub_date(item)
+                title     = title_tag.get_text(strip=True) if title_tag else "No Title"
 
-                title = title_tag.get_text(strip=True) if title_tag else "No Title"
-
-                # lxml-xml quirk: <link> URL is often a NavigableString sibling,
-                # not the text content of the tag itself
+                # lxml-xml quirk: URL may be a sibling text node not tag content
                 raw_url: Optional[str] = None
                 if link_tag:
                     raw_url = link_tag.get_text(strip=True) or None
@@ -257,74 +294,58 @@ class Verifier:
                     sib = link_tag.next_sibling
                     if sib and isinstance(sib, str):
                         raw_url = sib.strip() or None
-
                 if not raw_url:
-                    logger.warning(f"   ⚠ Could not extract URL for: {title}")
+                    logger.warning(f"   ⚠ No URL for: {title}")
                     continue
 
-                # Resolve Google News redirect → real article URL
+                # Resolve Google redirect → real article URL
                 try:
                     resolved = self.session.get(
-                        raw_url,
-                        headers=self.headers,
-                        timeout=6,
-                        allow_redirects=True,
+                        raw_url, headers=self.news_headers, timeout=6, allow_redirects=True
                     )
                     real_url = resolved.url
                 except Exception as e:
                     logger.warning(f"Redirect failed for '{title}': {e}")
                     evidence.append({
-                        "url": raw_url,
-                        "title": title,
+                        "url": raw_url, "title": title,
                         "text": f"[Headline only — redirect failed]: {title}",
-                        "trusted": False,
-                        "pub_date": pub_date,
-                        "quality": "headline_only",
+                        "trusted": False, "pub_date": pub_date,
+                        "quality": "headline_only", "source_type": "news_rss",
                     })
                     continue
 
                 trusted = self.is_trusted(real_url)
-                logger.info(
-                    f"   {'✅ TRUSTED' if trusted else '🔵 Unknown'} | {real_url[:90]}"
-                )
+                logger.info(f"   {'✅ TRUSTED' if trusted else '🔵 Unknown'} | {real_url[:90]}")
 
                 content = self.scrape_article(real_url)
-
                 if content:
                     logger.info(f"   ✔ Scraped {len(content)} chars.")
                     evidence.append({
-                        "url": real_url,
-                        "title": title,
-                        "text": content,
-                        "trusted": trusted,
-                        "pub_date": pub_date,
-                        "quality": "full_text",
+                        "url": real_url, "title": title, "text": content,
+                        "trusted": trusted, "pub_date": pub_date,
+                        "quality": "full_text", "source_type": "news_rss",
                     })
                     scraped_count += 1
                 else:
-                    logger.info("   ⚠ Scrape failed — using headline fallback.")
+                    logger.info("   ⚠ Scrape failed — headline fallback.")
                     evidence.append({
-                        "url": real_url,
-                        "title": title,
+                        "url": real_url, "title": title,
                         "text": f"[Headline only — scrape failed]: {title}",
-                        "trusted": trusted,
-                        "pub_date": pub_date,
-                        "quality": "headline_only",
+                        "trusted": trusted, "pub_date": pub_date,
+                        "quality": "headline_only", "source_type": "news_rss",
                     })
 
         except Exception as e:
             logger.error(f"🔴 Google News RSS error: {e}")
 
-        # ── Source 2: Wikipedia ───────────────────────────────────────────────
-        # Especially valuable for political office claims where news scraping fails.
-        # Wikipedia reliably states current position holders for major public figures.
-        wiki = self.fetch_wikipedia_summary(query)
-        if wiki:
-            evidence.append(wiki)
-        else:
-            logger.info("   📖 No usable Wikipedia article found for this claim.")
+        # ── Source 2: Wikipedia (position page + person page) ─────────────────
+        wiki_results = self.fetch_wikipedia_evidence(query)
+        evidence.extend(wiki_results)
 
-        # ── Sort: trusted + full_text first ──────────────────────────────────
+        if not wiki_results:
+            logger.info("   📖 No usable Wikipedia articles found for this claim.")
+
+        # Sort: trusted + full_text first
         evidence.sort(
             key=lambda x: (x["trusted"], x["quality"] == "full_text"),
             reverse=True
@@ -332,10 +353,9 @@ class Verifier:
 
         logger.info(
             f"\n   ✅ Evidence ready: {len(evidence)} sources "
-            f"({sum(1 for e in evidence if e.get('quality') == 'full_text')} fully scraped, "
+            f"({sum(1 for e in evidence if e.get('quality') == 'full_text')} full text, "
             f"{sum(1 for e in evidence if e['trusted'])} trusted)\n"
         )
-
         return evidence
 
     # ─────────────────────────────────────────────
@@ -348,31 +368,28 @@ class Verifier:
         error = self.validate_claim(claim)
         if error:
             return {
-                "verdict": "ERROR",
-                "confidence": 0,
-                "explanation": error,
-                "correction": None,
-                "knowledge_cutoff_warning": False,
-                "evidence_quality": "NONE",
-                "sources": [],
-                "trusted_sources": [],
+                "verdict": "ERROR", "confidence": 0, "explanation": error,
+                "correction": None, "knowledge_cutoff_warning": False,
+                "evidence_quality": "NONE", "sources": [], "trusted_sources": [],
             }
 
         evidence_data = self.fetch_evidence(claim)
         evidence_quality = self._classify_evidence_quality(evidence_data)
 
         if not evidence_data:
-            logger.warning("No evidence found — proceeding with AI internal knowledge only.")
+            logger.warning("No evidence found — AI internal knowledge only.")
 
-        # ── Build structured evidence block for the prompt ────────────────────
+        # ── Build evidence block ──────────────────────────────────────────────
         evidence_lines: List[str] = []
         for e in evidence_data:
-            trust_tag = "[TRUSTED SOURCE]" if e["trusted"] else "[UNKNOWN SOURCE]"
-            text_tag  = "[FULL TEXT]"       if e.get("quality") == "full_text" else "[HEADLINE ONLY]"
-            date_tag  = f"[Published: {e['pub_date']}]" if e.get("pub_date") else "[Published: Unknown]"
+            trust_tag  = "[TRUSTED SOURCE]" if e["trusted"] else "[UNKNOWN SOURCE]"
+            text_tag   = "[FULL TEXT]" if e.get("quality") == "full_text" else "[HEADLINE ONLY]"
+            date_tag   = f"[Published: {e['pub_date']}]" if e.get("pub_date") else "[Published: Unknown]"
+            # Flag which Wikipedia article type it is so LLM can weigh correctly
+            wiki_tag   = f"[Wikipedia: {e.get('wiki_type','').replace('_',' ').upper()}]" if e.get("source_type") == "wikipedia" else ""
 
             evidence_lines.append(
-                f"{trust_tag} {text_tag} {date_tag}\n"
+                f"{trust_tag} {text_tag} {date_tag} {wiki_tag}\n"
                 f"Title: {e['title']}\n"
                 f"URL: {e['url']}\n"
                 f"Content: {e['text']}"
@@ -380,39 +397,33 @@ class Verifier:
 
         evidence_block = (
             "\n\n---\n\n".join(evidence_lines)
-            if evidence_lines
-            else "No live evidence was retrieved."
+            if evidence_lines else "No live evidence was retrieved."
         )
 
-        # ── Per-quality advisory injected into the prompt ─────────────────────
+        # ── Quality advisory ──────────────────────────────────────────────────
         quality_advisories = {
             "NO_EVIDENCE": (
-                "CRITICAL — No live evidence was retrieved. "
-                "You are operating on internal training knowledge alone. "
-                "For ANY time-sensitive claim (politics, appointments, deaths, sports), "
-                "you MUST set confidence <= 40 and knowledge_cutoff_warning = true. "
-                "Do NOT present stale training-data facts as current reality."
+                "CRITICAL — No live evidence retrieved. "
+                "For ANY time-sensitive claim set confidence <= 40 and "
+                "knowledge_cutoff_warning = true. Do NOT state time-sensitive "
+                "facts as certain from training data alone."
             ),
             "HEADLINES_ONLY": (
-                "WARNING — All evidence is headline-only; no full article text was fetched. "
-                "Headlines are often incomplete or misleading without body context. "
-                "Reduce your natural confidence estimate by ~20 points. "
-                "Do not treat a keyword match in a headline as confirmation of the claim."
+                "WARNING — All evidence is headline-only. "
+                "Reduce confidence by ~20 points. "
+                "Keyword match in headline does NOT confirm a claim."
             ),
             "LOW_TRUST": (
-                "NOTE — No verified/trusted sources are present in the evidence set. "
-                "Treat all retrieved evidence as provisional. "
-                "For well-known stable facts, your internal knowledge may be more reliable "
-                "than these unverified sources."
+                "NOTE — No trusted sources in evidence. "
+                "Treat all evidence as provisional."
             ),
             "MEDIUM_QUALITY": (
                 "Evidence quality is moderate. "
-                "Weight [TRUSTED SOURCE] items heavily over [UNKNOWN SOURCE] items."
+                "Weight [TRUSTED SOURCE] heavily over [UNKNOWN SOURCE]."
             ),
             "HIGH_QUALITY": (
                 "Evidence quality is high. "
-                "Multiple trusted sources with full text are available — "
-                "use them as the primary basis for your verdict."
+                "Use trusted full-text sources as the primary basis."
             ),
         }
         quality_advisory = quality_advisories.get(evidence_quality, "")
@@ -420,117 +431,104 @@ class Verifier:
         # ── System prompt ─────────────────────────────────────────────────────
         system_prompt = f"""You are a rigorous, neutral fact-checking analyst. Today's date is {CURRENT_DATE}.
 
-Verify the given claim using the live evidence provided AND your internal knowledge.
+Verify the given claim using the live evidence AND your internal knowledge.
 Follow ALL rules below without exception.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 1 — KNOWLEDGE CUTOFF DISCIPLINE  (most critical rule)
+RULE 1 — KNOWLEDGE CUTOFF DISCIPLINE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Your training data has a cutoff date. You cannot know current events with certainty.
+Your training data has a cutoff. You cannot know current events with certainty.
 
-POLITICAL OFFICE SPECIAL CASE (strictest sub-rule):
-  If the claim is about who currently holds any political position
-  (Chief Minister, Prime Minister, President, Governor, Minister, MP, MLA, etc.):
+POLITICAL OFFICE SPECIAL CASE:
+  If the claim is about who currently holds a political position
+  (CM, PM, President, Governor, Minister, MP, MLA, etc.):
 
-  • Trusted live source CONFIRMS the claim   → verdict REAL,  normal confidence.
-  • Trusted live source CONTRADICTS the claim → verdict FAKE,  normal confidence,
-                                                cite that source explicitly.
-  • NO trusted live source either way         → verdict UNCLEAR, confidence <= 45,
-                                                knowledge_cutoff_warning = true.
+  • Trusted live source CONFIRMS the claim    → REAL,    normal confidence.
+  • Trusted live source CONTRADICTS the claim → FAKE,    cite that source.
+  • No trusted live source either way         → UNCLEAR, confidence <= 45,
+                                               knowledge_cutoff_warning = true.
 
-  !! NEVER use your training data as the sole basis for a FAKE verdict on a
-  political office claim. Office holders change after your training cutoff.
-  Calling a potentially true claim FAKE is the worst error this system can make. !!
-
-  Wikipedia [TRUSTED SOURCE] counts as a trusted live source for this rule.
-  If Wikipedia states who holds the position, use that as your primary evidence.
+  !! NEVER use training data alone as the basis for a FAKE verdict on a
+  political office claim. Office holders change. Your training may be stale. !!
 
 General time-sensitive claims (deaths, disasters, elections, recent events):
-  • Live evidence confirms  → cite it, knowledge_cutoff_warning = false.
-  • Live evidence absent    → confidence <= 40, knowledge_cutoff_warning = true.
-  • Never assert these as certain from training data alone.
+  Live evidence confirms → cite it, knowledge_cutoff_warning = false.
+  Live evidence absent   → confidence <= 40, knowledge_cutoff_warning = true.
 
-Timeless facts (geography, settled science, pre-2023 history):
-  → Internal knowledge is reliable. Normal confidence allowed.
+Timeless facts (geography, science, pre-2023 history):
+  Internal knowledge is reliable. Normal confidence.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 1B — WIKIPEDIA STALENESS
+RULE 1B — WIKIPEDIA STALENESS + SOURCE PRIORITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Wikipedia can lag behind breaking political changes by days or weeks after
-a major event like a state election. Treat it as one source among many,
-not as the final word.
+Two types of Wikipedia articles may appear in evidence:
 
-Priority order when sources conflict for political office claims:
-  1. Multiple recent [FULL TEXT] news articles all agree  → follow the news consensus.
-                                                            This beats Wikipedia.
-  2. Single [TRUSTED SOURCE] + [FULL TEXT] confirms       → follow it.
-  3. Only Wikipedia available, no news contradicts it     → follow Wikipedia.
-  4. Wikipedia contradicts multiple recent news articles  → follow the news,
-                                                            note Wikipedia as stale.
+  [Wikipedia: POSITION PAGE] — e.g. "Chief Minister of West Bengal"
+    → Lists who CURRENTLY holds the office. Most up-to-date Wikipedia source.
+    → Treat as PRIMARY evidence for political office claims.
 
-NEVER let a stale Wikipedia page cause you to call a true claim FAKE.
-If recent news says X is CM but Wikipedia still says Y is CM, trust the news.
+  [Wikipedia: PERSON PAGE]   — e.g. "Suvendu Adhikari"
+    → May lag days or weeks behind a political change.
+    → Treat as SECONDARY / supporting evidence only.
+
+Priority order when sources conflict:
+
+  1. Multiple recent [FULL TEXT] news articles agree on the same fact
+     → Follow news consensus. This BEATS Wikipedia.
+  2. Wikipedia POSITION PAGE confirms or contradicts
+     → Follow it as primary trusted reference.
+  3. Wikipedia PERSON PAGE only, no news
+     → Use it but flag possible staleness.
+  4. Position page and news CONTRADICT person page
+     → Person page is stale. Follow position page + news.
+
+NEVER let a stale person page cause a true claim to be called FAKE.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 2 — ANTI-SENSATIONALISM
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Your explanation must be calm, neutral, and factual.
-
-NEVER use these words or phrases in your explanation:
-  shocking, explosive, bombshell, alarming, stunning, jaw-dropping,
-  outrageous, devastating, earth-shattering, goes viral, breaks the internet.
-
-Do NOT:
-  • Use emotionally charged or hyperbolic language.
-  • Assign political blame beyond what evidence directly supports.
-  • Exaggerate certainty to make the result sound more dramatic.
-
-Write as a neutral analyst, not a journalist optimising for clicks.
+Explanation must be calm, neutral, factual.
+NEVER use: shocking, explosive, bombshell, alarming, stunning,
+jaw-dropping, outrageous, devastating, earth-shattering.
+Do not assign political blame beyond what evidence directly supports.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 3 — ABSOLUTE FACT OVERRIDE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If a claim contradicts an established, timeless fact (wrong country for a city,
-basic science denial, wrong capital, etc.) → FAKE, confidence >= 90.
-No headline can override a well-established world fact.
+If a claim contradicts a timeless established fact (wrong country for a city,
+basic science denial, etc.) → FAKE, confidence >= 90.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 4 — KEYWORD TRAP
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Keywords from the claim appearing in a headline do NOT confirm the claim.
-If the article's actual context is unrelated to what the claim asserts,
-discard that evidence and explicitly note why.
+Keywords from the claim in a headline do NOT confirm the claim.
+If article context is unrelated to the claim, discard that evidence.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 5 — SOURCE WEIGHTING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Priority order (highest to lowest):
-  1. [TRUSTED SOURCE] + [FULL TEXT]     ← most reliable, use as primary basis
-  2. [TRUSTED SOURCE] + [HEADLINE ONLY] ← useful but treat with some caution
-  3. [UNKNOWN SOURCE] + [FULL TEXT]     ← read carefully, may be biased
-  4. [UNKNOWN SOURCE] + [HEADLINE ONLY] ← weakest, use only as supplementary signal
-
-If a trusted source explicitly debunks the claim → weight heavily toward FAKE/MISLEADING.
-[Published: Unknown] or visibly old dates reduce recency weight for time-sensitive claims.
+  1. [TRUSTED] + [FULL TEXT] + recent date  ← highest weight
+  2. [TRUSTED] + [FULL TEXT] + unknown date ← high weight
+  3. [TRUSTED] + [HEADLINE ONLY]            ← medium weight
+  4. [UNKNOWN] + [FULL TEXT]                ← low weight
+  5. [UNKNOWN] + [HEADLINE ONLY]            ← lowest weight
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 6 — VERDICT DEFINITIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REAL        — claim is factually accurate; evidence directly and credibly supports it.
-FAKE        — claim is factually false; evidence directly contradicts it, OR it violates
-              a timeless established fact (Rule 3).
-MISLEADING  — core fact is real, but framing, context, or implication distorts it.
-UNCLEAR     — genuinely unverifiable from available evidence; use sparingly.
-              (Required for political office claims with no trusted live source.)
+REAL       — claim is accurate; evidence directly supports it.
+FAKE       — claim is false; evidence directly contradicts it.
+MISLEADING — core fact is real but framing/context distorts it.
+UNCLEAR    — genuinely unverifiable; use sparingly.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 7 — EXPLANATION STRUCTURE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Your explanation MUST cover:
+Explanation must cover:
   (a) Which sources you used and why.
   (b) Which evidence you rejected and why.
-  (c) The correct facts if the claim is wrong or misleading.
-  (d) An explicit flag when using internal training knowledge instead of live evidence.
+  (c) Correct facts if claim is wrong.
+  (d) Explicit flag when using internal knowledge instead of live evidence.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EVIDENCE QUALITY ADVISORY
@@ -538,12 +536,12 @@ EVIDENCE QUALITY ADVISORY
 {quality_advisory}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT — valid JSON only, no preamble, no markdown fences
+OUTPUT — valid JSON only, no preamble, no markdown fences
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {{
   "verdict":                  "REAL" | "FAKE" | "MISLEADING" | "UNCLEAR",
   "confidence":               <integer 0-100>,
-  "explanation":              "<neutral, structured reasoning>",
+  "explanation":              "<neutral structured reasoning>",
   "correction":               "<correct fact if FAKE or MISLEADING, else null>",
   "knowledge_cutoff_warning": <true | false>
 }}"""
@@ -569,54 +567,40 @@ OUTPUT FORMAT — valid JSON only, no preamble, no markdown fences
                 max_tokens=1200,
             )
 
-            raw = completion.choices[0].message.content
+            raw    = completion.choices[0].message.content
             result = json.loads(raw)
 
-            # ── Validate required keys ────────────────────────────────────────
             for key in ("verdict", "confidence", "explanation"):
                 if key not in result:
-                    raise ValueError(f"Missing required key in AI response: '{key}'")
+                    raise ValueError(f"Missing key: '{key}'")
 
-            # ── Normalise and clamp fields ────────────────────────────────────
             result["verdict"] = result["verdict"].upper().strip()
             if result["verdict"] not in ("REAL", "FAKE", "MISLEADING", "UNCLEAR"):
-                logger.warning(
-                    f"Unexpected verdict '{result['verdict']}' — defaulting to UNCLEAR"
-                )
+                logger.warning(f"Unexpected verdict '{result['verdict']}' → UNCLEAR")
                 result["verdict"] = "UNCLEAR"
 
-            result["confidence"] = max(0, min(100, int(result.get("confidence", 0))))
-            result["knowledge_cutoff_warning"] = bool(
-                result.get("knowledge_cutoff_warning", False)
-            )
-            result["correction"]      = result.get("correction") or None
-            result["evidence_quality"] = evidence_quality
-            result["sources"]          = [e["url"] for e in evidence_data]
-            result["trusted_sources"]  = [e["url"] for e in evidence_data if e["trusted"]]
+            result["confidence"]             = max(0, min(100, int(result.get("confidence", 0))))
+            result["knowledge_cutoff_warning"] = bool(result.get("knowledge_cutoff_warning", False))
+            result["correction"]             = result.get("correction") or None
+            result["evidence_quality"]       = evidence_quality
+            result["sources"]                = [e["url"] for e in evidence_data]
+            result["trusted_sources"]        = [e["url"] for e in evidence_data if e["trusted"]]
 
             return result
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
             return {
-                "verdict": "ERROR",
-                "confidence": 0,
-                "explanation": "The AI returned malformed JSON. Please try again.",
-                "correction": None,
-                "knowledge_cutoff_warning": False,
-                "evidence_quality": evidence_quality,
-                "sources": [],
-                "trusted_sources": [],
+                "verdict": "ERROR", "confidence": 0,
+                "explanation": "AI returned malformed JSON. Please try again.",
+                "correction": None, "knowledge_cutoff_warning": False,
+                "evidence_quality": evidence_quality, "sources": [], "trusted_sources": [],
             }
         except Exception as e:
             logger.error(f"Verification error: {e}")
             return {
-                "verdict": "ERROR",
-                "confidence": 0,
-                "explanation": str(e),
-                "correction": None,
-                "knowledge_cutoff_warning": False,
-                "evidence_quality": evidence_quality,
-                "sources": [],
-                "trusted_sources": [],
+                "verdict": "ERROR", "confidence": 0, "explanation": str(e),
+                "correction": None, "knowledge_cutoff_warning": False,
+                "evidence_quality": evidence_quality, "sources": [], "trusted_sources": [],
             }
+
