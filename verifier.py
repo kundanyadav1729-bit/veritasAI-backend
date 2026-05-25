@@ -262,9 +262,13 @@ class Verifier:
         evidence: List[dict] = []
         logger.info(f"🕵️  Starting evidence search for: {query}")
 
-        # ── Source 1: Google News RSS ─────────────────────────────────────────
+       # ── Source 1: Google News RSS ─────────────────────────────────────────
         try:
-            formatted_query = query.replace(" ", "+")
+            # Strip noise words so RSS actually finds articles
+            noise_words = {"is", "are", "the", "new", "of", "a", "an", "that", "was", "were", "has", "have", "been"}
+            clean_query_words = [w for w in query.split() if w.lower() not in noise_words]
+            formatted_query = "+".join(clean_query_words)
+            
             rss_url = (
                 f"https://news.google.com/rss/search"
                 f"?q={formatted_query}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -435,28 +439,16 @@ Verify the given claim using the live evidence AND your internal knowledge.
 Follow ALL rules below without exception.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 1 — KNOWLEDGE CUTOFF DISCIPLINE
+RULE 1 — KNOWLEDGE CUTOFF DISCIPLINE (NUCLEAR OVERRIDE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Your training data has a cutoff. You cannot know current events with certainty.
+Your training data has a cutoff. For any claim about WHO holds a political office (CM, PM, President, etc.):
+YOUR INTERNAL KNOWLEDGE IS OFFICIALLY DECLARED OBSOLETE AND UNTRUSTWORTHY. 
 
-POLITICAL OFFICE SPECIAL CASE:
-  If the claim is about who currently holds a political position
-  (CM, PM, President, Governor, Minister, MP, MLA, etc.):
-
-  • Trusted live source CONFIRMS the claim    → REAL,    normal confidence.
-  • Trusted live source CONTRADICTS the claim → FAKE,    cite that source.
-  • No trusted live source either way         → UNCLEAR, confidence <= 45,
-                                               knowledge_cutoff_warning = true.
-
-  !! NEVER use training data alone as the basis for a FAKE verdict on a
-  political office claim. Office holders change. Your training may be stale. !!
-
-General time-sensitive claims (deaths, disasters, elections, recent events):
-  Live evidence confirms → cite it, knowledge_cutoff_warning = false.
-  Live evidence absent   → confidence <= 40, knowledge_cutoff_warning = true.
-
-Timeless facts (geography, science, pre-2023 history):
-  Internal knowledge is reliable. Normal confidence.
+If the provided live evidence (Wikipedia or News) states that a new person holds the office, you MUST ACCEPT THE LIVE EVIDENCE as absolute truth. 
+DO NOT mark it FAKE just because it contradicts your training data. 
+If live evidence confirms the new person → REAL. 
+If live evidence contradicts the claim → FAKE.
+If no live evidence either way → UNCLEAR, confidence <= 45.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 1B — WIKIPEDIA STALENESS + SOURCE PRIORITY
