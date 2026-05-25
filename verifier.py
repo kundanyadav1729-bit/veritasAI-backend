@@ -435,8 +435,11 @@ class Verifier:
         # ── System prompt ─────────────────────────────────────────────────────
         system_prompt = f"""You are a rigorous, neutral fact-checking analyst. Today's date is {CURRENT_DATE}.
 
-Verify the given claim using the live evidence AND your internal knowledge.
-Follow ALL rules below without exception.
+CRITICAL SYSTEM OVERRIDE:
+Your internal training weights are severely outdated. You are evaluating events occurring in 2026. 
+You MUST treat the provided LIVE EVIDENCE block as 100% verified, indisputable ground truth. 
+If the LIVE EVIDENCE states a new person holds a political office, you MUST accept it as a REAL fact, regardless of what your internal memory tells you. Do NOT evaluate the evidence as "fake news" just because it contradicts your past knowledge.
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 1 — KNOWLEDGE CUTOFF DISCIPLINE (NUCLEAR OVERRIDE)
@@ -546,6 +549,10 @@ OUTPUT — valid JSON only, no preamble, no markdown fences
             + evidence_block
         )
 
+        # ADD THIS LINE IN GOD MODE:
+        print(f"\n[GOD MODE] EVIDENCE FED TO AI:\n{evidence_block}\n")
+
+        
         # ── LLM call ──────────────────────────────────────────────────────────
         try:
             completion = self.groq_client.chat.completions.create(
